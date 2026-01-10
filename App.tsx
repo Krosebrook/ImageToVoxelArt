@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { generateImage, generateVoxelScene } from './services/gemini';
 import { 
   extractHtmlFromText, 
@@ -12,14 +12,26 @@ import {
   setCameraView, 
   injectSubtleAnimation, 
   updateSceneParameters,
-  injectExporterBridge
+  injectExporterBridge,
+  injectVoxelPhysics,
+  injectInteractionBridge
 } from './utils/html';
 
+// --- Types ---
 type AppStatus = 'idle' | 'generating_image' | 'generating_voxels' | 'error' | 'saving';
 type VoxelStyle = 'Classic' | 'Micro' | 'Low Poly' | 'Cyberpunk';
-type InspectorTab = 'transform' | 'atmosphere' | 'export';
+type VoxelSizeLabel = 'Micro' | 'Classic' | 'Large';
+type InspectorTab = 'transform' | 'atmosphere' | 'physics' | 'export';
+type ExportFormat = 'OBJ' | 'VOX' | 'GLTF';
+type ToolMode = 'view' | 'paint' | 'erase';
 
-interface UserContent {
+const VOXEL_SIZE_MAP: Record<VoxelSizeLabel, number> = {
+  'Micro': 0.5,
+  'Classic': 1.0,
+  'Large': 2.0
+};
+
+interface SceneState {
   image: string;
   voxel: string | null;
   prompt: string;
@@ -29,558 +41,562 @@ interface UserContent {
   lightIntensity: number;
   fogDensity: number;
   style: VoxelStyle;
+  voxelSize: VoxelSizeLabel;
 }
 
-interface SavedScene extends UserContent {
+interface SavedScene extends SceneState {
   id: string;
   timestamp: number;
-  thumbnail: string; // Captured 3D snapshot or source image
+  thumbnail: string;
 }
 
-const STORAGE_KEY = 'voxel_forge_vault_v5';
+// --- Constants ---
+const STORAGE_KEY = 'voxel_forge_v5_pro';
 const ASPECT_RATIOS = ["1:1", "3:4", "4:3", "16:9", "9:16"];
 const STYLES: VoxelStyle[] = ['Classic', 'Micro', 'Low Poly', 'Cyberpunk'];
+const VOXEL_SIZES: VoxelSizeLabel[] = ['Micro', 'Classic', 'Large'];
 
-const SAMPLE_PROMPTS = [
-  "A tree house under the sea",
-  "A cyberpunk street food stall", 
-  "An ancient temple floating in the sky",
-  "A cozy winter cabin with smoke",
-  "A futuristic mars rover",
-  "A dragon guarding gold"
-];
-
-const EXAMPLES = [
-  { img: 'https://www.gstatic.com/aistudio/starter-apps/image_to_voxel/example1.png', id: 'ex1' },
-  { img: 'https://www.gstatic.com/aistudio/starter-apps/image_to_voxel/example2.png', id: 'ex2' },
-  { img: 'https://www.gstatic.com/aistudio/starter-apps/image_to_voxel/example3.png', id: 'ex3' },
+const PRESETS = [
+  { name: 'Cyberpunk City', prompt: 'A neon-drenched cyberpunk street with hover-cars and glowing signs', style: 'Cyberpunk' as VoxelStyle, icon: '🏙️' },
+  { name: 'Fantasy Forest', prompt: 'An enchanted forest with glowing mushrooms and a hidden treehouse', style: 'Low Poly' as VoxelStyle, icon: '🌲' },
+  { name: 'Sci-Fi Interior', prompt: 'The bridge of a futuristic spaceship with holographic consoles', style: 'Micro' as VoxelStyle, icon: '🚀' },
+  { name: 'Ancient Ruins', prompt: 'Overgrown stone ruins of a forgotten desert temple', style: 'Classic' as VoxelStyle, icon: '🏛️' },
+  { name: 'Underwater Kingdom', prompt: 'A majestic coral castle with glowing jellyfish and bioluminescent sea life', style: 'Low Poly' as VoxelStyle, icon: '🏰' },
+  { name: 'Alien Planet', prompt: 'Strange crystalline formations and purple flora on a foreign world with two moons', style: 'Micro' as VoxelStyle, icon: '🪐' },
+  { name: 'Haunted Mansion', prompt: 'A spooky Victorian mansion with ghostly apparitions and twisted iron gates', style: 'Classic' as VoxelStyle, icon: '👻' },
+  { name: 'Steampunk City', prompt: 'Brass pipes, steam engines, and giant clockwork gears in a Victorian industrial city', style: 'Cyberpunk' as VoxelStyle, icon: '⚙️' },
+  { name: 'Fairy Tale Village', prompt: 'Quaint cottages with thatched roofs and flower gardens in a peaceful valley', style: 'Low Poly' as VoxelStyle, icon: '🍄' },
+  { name: 'Volcanic Peak', prompt: 'A dark volcanic mountain with flowing lava and black obsidian rocks', style: 'Classic' as VoxelStyle, icon: '🌋' },
+  { name: 'Art Deco City', prompt: 'Gleaming skyscrapers with gold accents, geometric patterns, and marble statues in 1920s style', style: 'Classic' as VoxelStyle, icon: '🎷' },
+  { name: 'Wild West', prompt: 'A dusty wooden saloon and general store in a desert town at high noon with cacti', style: 'Classic' as VoxelStyle, icon: '🤠' },
+  { name: 'Zen Garden', prompt: 'A peaceful Japanese garden with raked sand patterns, bonsai trees, and koi ponds', style: 'Low Poly' as VoxelStyle, icon: '🎋' },
+  { name: 'Glitch Dimension', prompt: 'Abstract floating geometric shapes with corrupted textures, wireframes, and neon artifacts', style: 'Cyberpunk' as VoxelStyle, icon: '👾' },
+  { name: 'Arctic Outpost', prompt: 'A scientific research station on a frozen glacier with snow vehicles and aurora borealis', style: 'Micro' as VoxelStyle, icon: '❄️' },
 ];
 
 const App: React.FC = () => {
-  const [prompt, setPrompt] = useState('');
-  const [placeholderIndex, setPlaceholderIndex] = useState(0);
-  const [selectedTile, setSelectedTile] = useState<number | 'user' | string | null>(null);
-  const [showGenerator, setShowGenerator] = useState(false);
-  const [showRoadmap, setShowRoadmap] = useState(false);
+  // UI State
   const [status, setStatus] = useState<AppStatus>('idle');
-  const [errorMsg, setErrorMsg] = useState('');
-  const [thinkingText, setThinkingText] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<'image' | 'voxel'>('image');
+  const isLoading = useMemo(() => status === 'generating_image' || status === 'generating_voxels', [status]);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [showGenerator, setShowGenerator] = useState(false);
   const [activeTab, setActiveTab] = useState<InspectorTab>('transform');
-  
+  const [viewMode, setViewMode] = useState<'image' | 'voxel'>('image');
+  const [thinkingText, setThinkingText] = useState<string | null>(null);
+
+  // Scene Configuration
+  const [prompt, setPrompt] = useState('');
   const [imageData, setImageData] = useState<string | null>(null);
   const [voxelCode, setVoxelCode] = useState<string | null>(null);
-  const [palette, setPalette] = useState<string[]>(['#FF0000', '#00FF00', '#0000FF']);
-  const [sceneBgColor, setSceneBgColor] = useState('#ffffff');
+  const [palette, setPalette] = useState<string[]>(['#FF0000', '#00FF00', '#0000FF', '#000000', '#FFFFFF']);
+  const [bgColor, setBgColor] = useState('#ffffff');
   const [autoRotate, setAutoRotate] = useState(true);
   const [lightIntensity, setLightIntensity] = useState(1.0);
   const [fogDensity, setFogDensity] = useState(0.5);
-  const [voxelStyle, setVoxelStyle] = useState<VoxelStyle>('Classic');
-  const [aspectRatio, setAspectRatio] = useState('1:1');
+  const [style, setStyle] = useState<VoxelStyle>('Classic');
+  const [voxelSizeLabel, setVoxelSizeLabel] = useState<VoxelSizeLabel>('Classic');
+  const [ratio, setRatio] = useState('1:1');
+  const [physicsOn, setPhysicsOn] = useState(false);
 
-  const [history, setHistory] = useState<UserContent[]>([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
-  const [savedScenes, setSavedScenes] = useState<SavedScene[]>([]);
-  const [loadedThumbnails, setLoadedThumbnails] = useState<Record<string, string>>({});
+  // Tools
+  const [currentTool, setCurrentTool] = useState<ToolMode>('view');
+  const [selectedPaletteIndex, setSelectedPaletteIndex] = useState(0);
+  // Track edit history availability from the iframe
+  const [editHistory, setEditHistory] = useState({ canUndo: false, canRedo: false });
+
+  // Export Settings
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('GLTF');
+  const [optimizeExport, setOptimizeExport] = useState(true);
+  const [exportLOD, setExportLOD] = useState('High');
+
+  // Persistence & History
+  const [history, setHistory] = useState<SceneState[]>([]);
+  const [historyIdx, setHistoryIdx] = useState(-1);
+  const [vault, setVault] = useState<SavedScene[]>([]);
+  const [selectedId, setSelectedId] = useState<string | 'user' | null>(null);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const pendingSaveResolve = useRef<((dataUrl: string) => void) | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const pendingSave = useRef<((url: string) => void) | null>(null);
 
+  // --- Effects ---
   useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) try { setSavedScenes(JSON.parse(raw)); } catch (e) { localStorage.removeItem(STORAGE_KEY); }
-    const interval = setInterval(() => setPlaceholderIndex(p => (p + 1) % SAMPLE_PROMPTS.length), 3000);
-    return () => clearInterval(interval);
+    if (raw) try { setVault(JSON.parse(raw)); } catch (e) { localStorage.removeItem(STORAGE_KEY); }
   }, []);
 
   useEffect(() => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(savedScenes)); } 
-    catch (e) { 
-      console.warn("Local storage full, capping gallery size.");
-      if (savedScenes.length > 50) setSavedScenes(prev => prev.slice(0, 50)); 
-    }
-  }, [savedScenes]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(vault.slice(0, 50)));
+  }, [vault]);
+
+  // Reset local edit history when scene changes
+  useEffect(() => {
+     setEditHistory({ canUndo: false, canRedo: false });
+  }, [voxelCode]);
 
   useEffect(() => {
-    const loadThumbnails = async () => {
-      const loaded: Record<string, string> = {};
-      await Promise.all(EXAMPLES.map(async (ex) => {
-        try {
-          const res = await fetch(ex.img);
-          if (res.ok) loaded[ex.id] = URL.createObjectURL(await res.blob());
-        } catch (e) { console.error(e); }
-      }));
-      setLoadedThumbnails(loaded);
-    };
-    loadThumbnails();
-  }, []);
-
-  useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      if (!event.data) return;
-
-      if (event.data.type === 'SNAPSHOT_RESULT' && pendingSaveResolve.current) {
-        pendingSaveResolve.current(event.data.dataUrl);
-        pendingSaveResolve.current = null;
+    const handleMessage = (e: MessageEvent) => {
+      if (!e.data) return;
+      if (e.data.type === 'SNAPSHOT_RESULT' && pendingSave.current) {
+        pendingSave.current(e.data.dataUrl);
+        pendingSave.current = null;
       }
-
-      if (event.data.type === 'EXPORT_RESULT') {
-        const { format, content } = event.data;
-        const blob = new Blob([content], { type: 'text/plain' });
+      if (e.data.type === 'EXPORT_RESULT') {
+        const { format, content } = e.data;
+        const extension = format.toLowerCase();
+        const mimeType = format === 'GLTF' ? 'application/json' : 'text/plain';
+        const blob = new Blob([content], { type: mimeType });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = url;
-        a.download = `voxel_forge_export_${Date.now()}.${format.toLowerCase()}`;
-        a.click();
-        URL.revokeObjectURL(url);
+        a.href = url; a.download = `voxel_forge_${Date.now()}.${extension}`;
+        a.click(); URL.revokeObjectURL(url);
+        setStatus('idle');
+      }
+      if (e.data.type === 'HISTORY_STATUS') {
+        setEditHistory({ canUndo: e.data.canUndo, canRedo: e.data.canRedo });
       }
     };
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
   }, []);
 
+  // --- Tool & Bridge Communications ---
   useEffect(() => {
-    if (historyIndex >= 0 && historyIndex < history.length && selectedTile === 'user') {
-      const s = history[historyIndex];
-      setImageData(s.image);
-      setVoxelCode(s.voxel);
-      setPrompt(s.prompt);
-      setPalette(s.palette);
-      setSceneBgColor(s.backgroundColor);
-      setAutoRotate(s.autoRotate);
-      setLightIntensity(s.lightIntensity);
-      setFogDensity(s.fogDensity);
-      setVoxelStyle(s.style);
+    // Sync Tool
+    iframeRef.current?.contentWindow?.postMessage({ type: 'SET_TOOL', tool: currentTool }, '*');
+    // If not View, ensure autoRotate is off logic is handled inside bridge, 
+    // but we can also force it via state here to be consistent.
+    if (currentTool !== 'view' && autoRotate) {
+       setAutoRotate(false);
+       handlePatch({ autoRotate: false });
     }
-  }, [historyIndex, history, selectedTile]);
+  }, [currentTool]);
 
-  const handleUndo = useCallback(() => historyIndex > 0 && setHistoryIndex(p => p - 1), [historyIndex]);
-  const handleRedo = useCallback(() => historyIndex < history.length - 1 && setHistoryIndex(p => p + 1), [historyIndex, history.length]);
+  useEffect(() => {
+    // Sync active color for paint
+    if (palette[selectedPaletteIndex]) {
+       iframeRef.current?.contentWindow?.postMessage({ type: 'SET_COLOR', color: palette[selectedPaletteIndex] }, '*');
+    }
+  }, [selectedPaletteIndex, palette]);
 
-  const pushToHistory = useCallback((newState: UserContent) => {
+
+  // --- Core Logic ---
+  const getCurrentState = useCallback((): SceneState => ({
+    image: imageData || '', voxel: voxelCode, prompt, palette, 
+    backgroundColor: bgColor, autoRotate, lightIntensity, fogDensity, style,
+    voxelSize: voxelSizeLabel
+  }), [imageData, voxelCode, prompt, palette, bgColor, autoRotate, lightIntensity, fogDensity, style, voxelSizeLabel]);
+
+  const commitToHistory = useCallback((state: SceneState) => {
     setHistory(prev => {
-      const updated = prev.slice(0, historyIndex + 1);
-      updated.push(newState);
-      return updated.length > 15 ? updated.slice(1) : updated;
+      const up = prev.slice(0, historyIdx + 1);
+      up.push(state);
+      return up.slice(-20);
     });
-    setHistoryIndex(prev => Math.min(prev + 1, 14));
-  }, [historyIndex]);
+    setHistoryIdx(prev => Math.min(prev + 1, 19));
+  }, [historyIdx]);
 
-  const patchScene = useCallback((paramsOverride?: Partial<{
-    backgroundColor: string, 
-    autoRotate: boolean,
-    lightIntensity: number,
-    fogDensity: number
-  }>) => {
-    if (!voxelCode) return;
-    const p = {
-      backgroundColor: paramsOverride?.backgroundColor ?? sceneBgColor,
-      autoRotate: paramsOverride?.autoRotate ?? autoRotate,
-      lightIntensity: paramsOverride?.lightIntensity ?? lightIntensity,
-      fogDensity: paramsOverride?.fogDensity ?? fogDensity
-    };
-    const updated = updateSceneParameters(voxelCode, p);
-    setVoxelCode(updated);
-    if (selectedTile === 'user' && imageData) {
-      pushToHistory({
-        image: imageData, voxel: updated, prompt, palette: [...palette],
-        backgroundColor: p.backgroundColor, autoRotate: p.autoRotate,
-        lightIntensity: p.lightIntensity, fogDensity: p.fogDensity, style: voxelStyle
-      });
-    }
-  }, [voxelCode, sceneBgColor, autoRotate, lightIntensity, fogDensity, selectedTile, imageData, prompt, palette, voxelStyle, pushToHistory]);
-
-  const handleImageGenerate = async () => {
-    if (!prompt.trim()) return;
-    setStatus('generating_image');
-    setErrorMsg('');
-    setImageData(null);
-    setVoxelCode(null);
-    setThinkingText(null);
-    setViewMode('image');
-
-    try {
-      const imageUrl = await generateImage(prompt, aspectRatio, true);
-      const state: UserContent = {
-        image: imageUrl, voxel: null, prompt, palette: [...palette], 
-        backgroundColor: sceneBgColor, autoRotate, lightIntensity, fogDensity, style: voxelStyle
-      };
-      pushToHistory(state);
-      setSelectedTile('user');
-      setStatus('idle');
-      setShowGenerator(false);
-    } catch (err: any) {
-      setStatus('error');
-      setErrorMsg(err.message || "Image generation failed.");
-    }
+  const applyHistoryState = (idx: number) => {
+    const s = history[idx];
+    if (!s) return;
+    setImageData(s.image); setVoxelCode(s.voxel); setPrompt(s.prompt); setPalette(s.palette);
+    setBgColor(s.backgroundColor); setAutoRotate(s.autoRotate); setLightIntensity(s.lightIntensity);
+    setFogDensity(s.fogDensity); setStyle(s.style); setVoxelSizeLabel(s.voxelSize);
+    setHistoryIdx(idx);
   };
 
-  const handleVoxelize = async () => {
+  const handleGenImage = async () => {
+    if (!prompt) return;
+    setStatus('generating_image'); setErrorMsg(null);
+    try {
+      const url = await generateImage(prompt, ratio);
+      setImageData(url); setVoxelCode(null); setViewMode('image');
+      commitToHistory({ ...getCurrentState(), image: url, voxel: null });
+      setStatus('idle'); setShowGenerator(false); setSelectedId('user');
+    } catch (e: any) { setStatus('error'); setErrorMsg(e.message); }
+  };
+
+  const handleTransmute = async () => {
     if (!imageData) return;
-    setStatus('generating_voxels');
-    setErrorMsg('');
-    setThinkingText(null);
-
+    setStatus('generating_voxels'); setErrorMsg(null); setThinkingText(null);
     try {
-      const codeRaw = await generateVoxelScene(imageData, setThinkingText, palette);
-      const processed = updateSceneParameters(
-        injectExporterBridge(injectSubtleAnimation(hideBodyText(codeRaw))), 
-        { backgroundColor: sceneBgColor, autoRotate, lightIntensity, fogDensity }
+      const numericSize = VOXEL_SIZE_MAP[voxelSizeLabel];
+      const raw = await generateVoxelScene(imageData, setThinkingText, palette, numericSize);
+      // Chain injectors: Basic -> Physics -> Bridge -> Interactions -> Params
+      const prepped = updateSceneParameters(
+        setCameraView(
+          injectInteractionBridge(
+            injectVoxelPhysics(
+              injectExporterBridge(
+                injectSubtleAnimation(hideBodyText(raw))
+              )
+            )
+          ), 
+          { x: 40, y: 40, z: 40 }
+        ),
+        { backgroundColor: bgColor, autoRotate, lightIntensity, fogDensity }
       );
-      setVoxelCode(processed);
-      if (selectedTile === 'user') {
-        pushToHistory({
-          image: imageData, voxel: processed, prompt, palette: [...palette],
-          backgroundColor: sceneBgColor, autoRotate, lightIntensity, fogDensity, style: voxelStyle
-        });
-      }
-      setViewMode('voxel');
+      setVoxelCode(prepped); setViewMode('voxel');
+      commitToHistory({ ...getCurrentState(), voxel: prepped });
       setStatus('idle');
-    } catch (err: any) {
-      setStatus('error');
-      setErrorMsg(err.message || "Voxelization failed.");
-    }
+    } catch (e: any) { setStatus('error'); setErrorMsg(e.message); }
   };
 
-  const requestSnapshot = (): Promise<string> => {
-    return new Promise((resolve) => {
-      if (!iframeRef.current || !iframeRef.current.contentWindow || !voxelCode) {
-        resolve(imageData || '');
-        return;
-      }
-      pendingSaveResolve.current = resolve;
-      iframeRef.current.contentWindow.postMessage({ type: 'GET_SNAPSHOT' }, '*');
-      // Timeout fallback
-      setTimeout(() => {
-        if (pendingSaveResolve.current === resolve) {
-          resolve(imageData || '');
-          pendingSaveResolve.current = null;
-        }
-      }, 1000);
-    });
-  };
-
-  const handleSaveToGallery = async () => {
+  const handleSave = async () => {
     if (!imageData) return;
     setStatus('saving');
-    
-    // Attempt to get a high-quality 3D render snapshot
-    const thumbnail = await requestSnapshot();
-
-    const newScene: SavedScene = {
-      id: `scene_${Date.now()}`, 
-      timestamp: Date.now(), 
-      image: imageData, 
-      voxel: voxelCode,
-      prompt, palette: [...palette], 
-      backgroundColor: sceneBgColor, 
-      autoRotate, 
-      lightIntensity, 
-      fogDensity, 
-      style: voxelStyle,
-      thumbnail
-    };
-    
-    setSavedScenes(prev => [newScene, ...prev]);
-    setStatus('idle');
+    const thumb: string = await new Promise(res => {
+      if (!iframeRef.current?.contentWindow || !voxelCode) return res(imageData);
+      pendingSave.current = res;
+      iframeRef.current.contentWindow.postMessage({ type: 'GET_SNAPSHOT' }, '*');
+      setTimeout(() => { if (pendingSave.current === res) res(imageData); }, 1500);
+    });
+    const s: SavedScene = { ...getCurrentState(), image: imageData, id: `s_${Date.now()}`, timestamp: Date.now(), thumbnail: thumb };
+    setVault(prev => [s, ...prev]); setStatus('idle');
   };
 
-  const handleDeleteScene = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (confirm("Permanently remove this creation from your vault?")) {
-      setSavedScenes(prev => prev.filter(s => s.id !== id));
-      if (selectedTile === id) setSelectedTile(null);
+  const loadVaultScene = (s: SavedScene) => {
+    setImageData(s.image); setVoxelCode(s.voxel); setPrompt(s.prompt); setPalette(s.palette);
+    setBgColor(s.backgroundColor); setAutoRotate(s.autoRotate); setLightIntensity(s.lightIntensity);
+    setFogDensity(s.fogDensity); setStyle(s.style); setVoxelSizeLabel(s.voxelSize);
+    setViewMode(s.voxel ? 'voxel' : 'image');
+    setSelectedId(s.id); setShowGenerator(false);
+  };
+
+  const handlePatch = (overrides: Partial<SceneState>) => {
+    if (!voxelCode) return;
+    const up = updateSceneParameters(voxelCode, { 
+      backgroundColor: overrides.backgroundColor ?? bgColor, 
+      autoRotate: overrides.autoRotate ?? autoRotate, 
+      lightIntensity: overrides.lightIntensity ?? lightIntensity, 
+      fogDensity: overrides.fogDensity ?? fogDensity 
+    });
+    setVoxelCode(up);
+  };
+
+  const handleExport = () => {
+    if (iframeRef.current?.contentWindow) {
+      setStatus('saving');
+      iframeRef.current.contentWindow.postMessage({ 
+        type: 'EXPORT_SCENE', 
+        format: exportFormat,
+        options: {
+          optimize: optimizeExport,
+          lod: exportLOD
+        }
+      }, '*');
     }
   };
 
-  const handleExport = (format: 'OBJ' | 'VOX') => {
-    if (iframeRef.current && iframeRef.current.contentWindow) {
-      iframeRef.current.contentWindow.postMessage({ type: 'EXPORT_SCENE', format }, '*');
+  const togglePhysics = (on: boolean) => { setPhysicsOn(on); iframeRef.current?.contentWindow?.postMessage({ type: 'TOGGLE_PHYSICS', enabled: on }, '*'); };
+  const resetPhysics = () => iframeRef.current?.contentWindow?.postMessage({ type: 'RESET_PHYSICS' }, '*');
+
+  // --- Palette Management ---
+  const addPaletteColor = () => setPalette([...palette, '#333333']);
+  const removePaletteColor = (index: number) => {
+    const newPalette = palette.filter((_, i) => i !== index);
+    setPalette(newPalette);
+    if (selectedPaletteIndex >= newPalette.length) setSelectedPaletteIndex(Math.max(0, newPalette.length - 1));
+  };
+  const updatePaletteColor = (index: number, color: string) => {
+    const newPalette = [...palette];
+    newPalette[index] = color;
+    setPalette(newPalette);
+  };
+  const movePaletteColor = (index: number, direction: 'left' | 'right') => {
+    if (direction === 'left' && index === 0) return;
+    if (direction === 'right' && index === palette.length - 1) return;
+    const newPalette = [...palette];
+    const targetIndex = direction === 'left' ? index - 1 : index + 1;
+    [newPalette[index], newPalette[targetIndex]] = [newPalette[targetIndex], newPalette[index]];
+    setPalette(newPalette);
+    if (selectedPaletteIndex === index) setSelectedPaletteIndex(targetIndex);
+    else if (selectedPaletteIndex === targetIndex) setSelectedPaletteIndex(index);
+  };
+
+  // --- Undo / Redo Handlers ---
+  const handleUndo = () => {
+    if (editHistory.canUndo) {
+      iframeRef.current?.contentWindow?.postMessage({ type: 'UNDO_EDIT' }, '*');
+    } else if (historyIdx > 0) {
+      applyHistoryState(historyIdx - 1);
     }
   };
 
-  const handleSavedTileClick = (scene: SavedScene) => {
-    setSelectedTile(scene.id);
-    setImageData(scene.image);
-    setVoxelCode(scene.voxel);
-    setPrompt(scene.prompt);
-    setPalette(scene.palette);
-    setSceneBgColor(scene.backgroundColor);
-    setAutoRotate(scene.autoRotate);
-    setLightIntensity(scene.lightIntensity);
-    setFogDensity(scene.fogDensity);
-    setVoxelStyle(scene.style);
-    setViewMode(scene.voxel ? 'voxel' : 'image');
-    setShowGenerator(false);
+  const handleRedo = () => {
+    if (editHistory.canRedo) {
+      iframeRef.current?.contentWindow?.postMessage({ type: 'REDO_EDIT' }, '*');
+    } else if (historyIdx < history.length - 1) {
+      applyHistoryState(historyIdx + 1);
+    }
   };
 
-  const isLoading = status !== 'idle' && status !== 'error' && status !== 'saving';
+  const canUndo = editHistory.canUndo || historyIdx > 0;
+  const canRedo = editHistory.canRedo || historyIdx < history.length - 1;
 
   return (
-    <div className="min-h-screen bg-white text-black font-sans selection:bg-yellow-200 py-12 px-6">
-      <style>{`
-        .loading-dots::after { content: ''; animation: dots 2s steps(4, end) infinite; }
-        @keyframes dots { 0%, 20% { content: ''; } 40% { content: '.'; } 60% { content: '..'; } 80% { content: '...'; } }
-        .custom-color-input { -webkit-appearance: none; border: none; width: 100%; height: 100%; cursor: pointer; background: none; }
-        .custom-color-input::-webkit-color-swatch { border: none; }
-        .hide-scrollbar::-webkit-scrollbar { display: none; }
-      `}</style>
+    <div className="min-h-screen bg-stone-50 text-stone-900 font-sans p-6 md:p-12 overflow-x-hidden selection:bg-yellow-200">
+      <style>{`.loading-dots::after { content: ''; animation: dots 1.5s infinite; } @keyframes dots { 0% { content: ''; } 33% { content: '.'; } 66% { content: '..'; } 100% { content: '...'; } }`}</style>
 
-      {showRoadmap && (
-        <div className="fixed inset-0 z-[100] bg-white p-8 overflow-y-auto animate-in fade-in slide-in-from-bottom-8 duration-300">
-          <div className="max-w-4xl mx-auto">
-            <div className="flex justify-between items-center border-b-4 border-black pb-8 mb-12">
-              <h2 className="text-6xl font-black uppercase tracking-tighter italic">The Lab</h2>
-              <button onClick={() => setShowRoadmap(false)} className="px-4 py-2 border-4 border-black hover:bg-black hover:text-white transition-all font-black text-xs">BACK TO FORGE</button>
-            </div>
-            <div className="grid md:grid-cols-2 gap-12">
-              <div className="space-y-8">
-                <h3 className="text-3xl font-black bg-yellow-300 inline-block px-4 border-2 border-black">V5.0 "VAULT"</h3>
-                <ul className="space-y-4 font-bold uppercase text-sm list-disc pl-5">
-                  <li>Render-Buffer Snapshots (Thumbnails)</li>
-                  <li>Mesh Exporter 3.0 (OBJ, MagicaVoxel)</li>
-                  <li>Real-time Atmosphere Patching</li>
-                  <li>Undo/Redo History Queue</li>
-                </ul>
-              </div>
-              <div className="space-y-8">
-                <h3 className="text-3xl font-black bg-pink-300 inline-block px-4 border-2 border-black">IN PROGRESS</h3>
-                <ul className="space-y-4 font-bold uppercase text-sm list-disc pl-5">
-                  <li>Multi-object Point Clouds</li>
-                  <li>Custom Voxel Physics</li>
-                  <li>Direct Web-to-Game Export</li>
-                </ul>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <div className="max-w-4xl mx-auto space-y-12">
-        <header className="border-b-4 border-black pb-8 flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+      <div className="max-w-6xl mx-auto space-y-12">
+        <header className="flex flex-col md:flex-row justify-between items-start md:items-end border-b-4 border-black pb-8 gap-6">
           <div className="space-y-2">
-            <h1 className="text-6xl md:text-8xl font-black uppercase leading-[0.8] tracking-tighter">VOXEL<br/>FORGE</h1>
-            <p className="text-xl font-bold text-gray-400 uppercase tracking-widest">Procedural 3D Foundry // v5.0</p>
+            <h1 className="text-7xl md:text-9xl font-black uppercase tracking-tighter leading-[0.8]">VOXEL<br/>FORGE</h1>
+            <p className="text-stone-400 font-bold uppercase text-xs tracking-[0.4em]">Engine v5.0 // Advanced AI Transmutation</p>
           </div>
-          <button onClick={() => setShowRoadmap(true)} className="px-6 py-2 border-4 border-black font-black uppercase text-sm shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] hover:bg-yellow-300 transition-all">Project Roadmap</button>
+          <div className="flex gap-4">
+            <button onClick={() => setShowGenerator(true)} className="px-8 py-4 bg-black text-white font-black uppercase text-sm shadow-[8px_8px_0px_0px_rgba(0,0,0,0.2)] hover:bg-stone-800 transition-all active:translate-y-1 active:shadow-none">Open Foundry</button>
+          </div>
         </header>
 
-        <section className="space-y-6">
-          <div className="flex items-end justify-between border-b-2 border-gray-100 pb-2">
-            <h2 className="text-xs font-black uppercase tracking-[0.3em] text-gray-300">Artifact Vault</h2>
-          </div>
-          <div className="flex gap-6 overflow-x-auto pb-6 hide-scrollbar">
-            {/* Create Button */}
-            <button onClick={() => { setSelectedTile('user'); setShowGenerator(true); }} className={`min-w-[120px] aspect-square border-4 border-black flex flex-col items-center justify-center transition-all shrink-0 shadow-[6px_6px_0px_0px_black] active:translate-y-1 active:shadow-none ${selectedTile === 'user' ? 'bg-black text-white' : 'bg-white hover:bg-gray-50'}`}>
+        {/* Artifact Vault */}
+        <section className="space-y-4">
+          <h2 className="text-[10px] font-black uppercase tracking-[0.3em] text-stone-300">Personal Artifact Vault</h2>
+          <div className="flex gap-4 overflow-x-auto pb-6 hide-scrollbar">
+            <button onClick={() => { setSelectedId('user'); setShowGenerator(true); }} className={`min-w-[140px] aspect-square border-4 border-black flex flex-col items-center justify-center bg-white shadow-[6px_6px_0px_0px_black] active:translate-y-1 active:shadow-none transition-all ${selectedId === 'user' ? 'bg-yellow-300' : 'hover:bg-stone-50'}`}>
               <span className="text-4xl font-black">+</span>
-              <span className="text-[10px] font-black uppercase tracking-tighter mt-2">New Forge</span>
+              <span className="text-[10px] font-black uppercase mt-2">New Entry</span>
             </button>
-            
-            {/* Examples */}
-            {EXAMPLES.map((ex, i) => (
-              <button key={i} onClick={() => { setSelectedTile(i); setViewMode('voxel'); setImageData(ex.img); setShowGenerator(false); }} className={`min-w-[120px] aspect-square border-4 border-black relative transition-all shrink-0 ${selectedTile === i ? 'scale-105 shadow-[8px_8px_0px_0px_black] z-10' : 'hover:-translate-y-1 hover:shadow-[4px_4px_0px_0px_black]'}`}>
-                <img src={loadedThumbnails[ex.id]} alt="" className="w-full h-full object-cover" />
-                <div className="absolute inset-x-0 bottom-0 bg-black text-white text-[8px] font-black py-1 px-2 uppercase tracking-tighter">System Template</div>
-              </button>
-            ))}
-
-            {/* User Saved Scenes with Snapshots */}
-            {savedScenes.map(s => (
-              <div key={s.id} className="relative shrink-0 group">
-                <button onClick={() => handleSavedTileClick(s)} className={`min-w-[120px] aspect-square border-4 border-black relative transition-all overflow-hidden ${selectedTile === s.id ? 'scale-105 shadow-[8px_8px_0px_0px_black] z-10' : 'hover:-translate-y-1 hover:shadow-[4px_4px_0px_0px_black]'}`}>
-                  <img src={s.thumbnail} className="w-full h-full object-cover" />
-                  <div className="absolute inset-0 bg-black/80 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center p-2 text-center">
-                    <span className="text-white text-[8px] font-black uppercase leading-tight line-clamp-3">{s.prompt}</span>
-                  </div>
+            {vault.map(s => (
+              <div key={s.id} className="relative group shrink-0">
+                <button onClick={() => loadVaultScene(s)} className={`min-w-[140px] aspect-square border-4 border-black overflow-hidden relative transition-all ${selectedId === s.id ? 'scale-105 shadow-[8px_8px_0px_0px_black] z-10 border-yellow-400' : 'hover:-translate-y-1 shadow-[4px_4px_0px_0px_black]'}`}>
+                  <img src={s.thumbnail} className="w-full h-full object-cover" alt="" />
                 </button>
-                <button onClick={(e) => handleDeleteScene(s.id, e)} className="absolute -top-2 -right-2 w-6 h-6 bg-red-500 text-white border-2 border-black rounded-full flex items-center justify-center text-xs font-black z-20 opacity-0 group-hover:opacity-100 transition-opacity hover:scale-110 active:scale-90">×</button>
+                <button onClick={(e) => { e.stopPropagation(); setVault(v => v.filter(x => x.id !== s.id)); }} className="absolute -top-2 -right-2 w-6 h-6 bg-red-500 border-2 border-black rounded-full text-white text-xs font-black opacity-0 group-hover:opacity-100 transition-all hover:scale-110">×</button>
               </div>
             ))}
           </div>
         </section>
 
+        {/* Generator Panel */}
         {showGenerator && (
-          <div className="p-8 border-4 border-black bg-gray-50 shadow-[10px_10px_0px_0px_black] space-y-8 animate-in slide-in-from-top-4 duration-300">
-            <div className="grid md:grid-cols-2 gap-8">
+          <div className="bg-white border-4 border-black p-8 shadow-[12px_12px_0px_0px_black] animate-in slide-in-from-top-4 duration-300 space-y-10">
+            <div className="space-y-4">
+              <label className="text-xs font-black uppercase">Rapid Presets</label>
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
+                {PRESETS.map(p => (
+                  <button key={p.name} onClick={() => { setPrompt(p.prompt); setStyle(p.style); }} className="p-4 border-2 border-black hover:bg-yellow-300 transition-all flex flex-col items-center gap-2 group active:translate-y-0.5">
+                    <span className="text-3xl group-hover:scale-110 transition-transform">{p.icon}</span>
+                    <span className="text-[10px] font-black uppercase text-center leading-none">{p.name}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            
+            {/* Palette Manager */}
+            <div className="space-y-4">
+              <div className="flex justify-between items-end">
+                <label className="text-xs font-black uppercase">Voxel Color Chromatics</label>
+                <button onClick={addPaletteColor} className="text-[10px] font-black uppercase border-2 border-black px-2 py-1 hover:bg-stone-100 transition-colors">Add Color</button>
+              </div>
+              <div className="flex gap-3 overflow-x-auto pb-4 hide-scrollbar min-h-[100px] items-center">
+                {palette.map((color, index) => (
+                  <div key={index} className="flex flex-col items-center gap-2 shrink-0 animate-in zoom-in-50 duration-200">
+                    <div className="w-14 h-14 border-4 border-black shadow-[4px_4px_0px_0px_black] relative group overflow-hidden">
+                      <input 
+                        type="color" 
+                        value={color} 
+                        onChange={e => updatePaletteColor(index, e.target.value)} 
+                        className="absolute inset-0 w-full h-full scale-150 cursor-pointer" 
+                      />
+                    </div>
+                    <div className="flex gap-1">
+                      <button onClick={() => movePaletteColor(index, 'left')} disabled={index === 0} className="w-5 h-5 flex items-center justify-center border border-black text-[10px] hover:bg-stone-100 disabled:opacity-20 transition-all">←</button>
+                      <button onClick={() => removePaletteColor(index)} className="w-5 h-5 flex items-center justify-center border border-black text-[10px] hover:bg-red-500 hover:text-white transition-all">×</button>
+                      <button onClick={() => movePaletteColor(index, 'right')} disabled={index === palette.length - 1} className="w-5 h-5 flex items-center justify-center border border-black text-[10px] hover:bg-stone-100 disabled:opacity-20 transition-all">→</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="grid md:grid-cols-2 gap-12">
               <div className="space-y-4">
-                <label className="block text-sm font-black uppercase">1. Visual Inspiration</label>
-                <div onClick={() => fileInputRef.current?.click()} className="h-48 border-4 border-dashed border-black flex flex-col items-center justify-center cursor-pointer bg-white hover:bg-gray-100 transition-all relative overflow-hidden">
-                  <input type="file" ref={fileInputRef} onChange={(e) => { const f = e.target.files?.[0]; if(f) { const r = new FileReader(); r.onload=(ev)=>setImageData(ev.target?.result as string); r.readAsDataURL(f); } }} className="hidden" />
-                  {imageData ? <img src={imageData} className="absolute inset-0 w-full h-full object-cover opacity-30" /> : null}
-                  <div className="relative z-10 flex flex-col items-center">
-                    <span className="text-3xl mb-2">🖼️</span>
-                    <span className="font-black uppercase text-xs">Drop Image or Click</span>
+                <label className="text-xs font-black uppercase">Visual Seed</label>
+                <div onClick={() => fileRef.current?.click()} className="h-60 border-4 border-dashed border-black bg-stone-50 flex flex-col items-center justify-center cursor-pointer hover:bg-stone-100 transition-all relative overflow-hidden group">
+                  <input type="file" ref={fileRef} className="hidden" onChange={e => { const f = e.target.files?.[0]; if(f){ const r = new FileReader(); r.onload=v=>setImageData(v.target?.result as string); r.readAsDataURL(f); } }} />
+                  {imageData && <img src={imageData} className="absolute inset-0 w-full h-full object-cover opacity-20 group-hover:opacity-30 transition-opacity" alt="" />}
+                  <div className="relative z-10 text-center">
+                    <span className="text-4xl mb-2 block">🖼️</span>
+                    <span className="text-[10px] font-black uppercase">Drop Source or Click</span>
                   </div>
                 </div>
               </div>
               <div className="space-y-6">
                 <div className="space-y-2">
-                  <label className="block text-sm font-black uppercase">2. Manifest Description</label>
-                  <textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder={SAMPLE_PROMPTS[placeholderIndex]} className="w-full p-4 border-4 border-black focus:outline-none font-bold placeholder:text-gray-300 h-24 resize-none" />
+                  <label className="text-xs font-black uppercase">Manifestation Prompt</label>
+                  <textarea value={prompt} onChange={e => setPrompt(e.target.value)} className="w-full h-32 p-4 border-4 border-black focus:ring-0 focus:outline-none font-bold text-lg resize-none placeholder:text-stone-200" placeholder="A futuristic pagoda floating in a neon cloudscape..." />
                 </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="block text-[10px] font-black uppercase text-gray-400">Geometry</label>
-                    <select value={aspectRatio} onChange={e => setAspectRatio(e.target.value)} className="w-full p-2 border-2 border-black font-bold uppercase text-xs bg-white">
+                <div className="grid grid-cols-3 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[9px] font-black uppercase text-stone-400">Dimensions</label>
+                    <select value={ratio} onChange={e => setRatio(e.target.value)} className="w-full p-3 border-2 border-black font-black uppercase text-xs bg-white">
                       {ASPECT_RATIOS.map(r => <option key={r} value={r}>{r}</option>)}
                     </select>
                   </div>
-                  <div className="space-y-2">
-                    <label className="block text-[10px] font-black uppercase text-gray-400">Art Style</label>
-                    <select value={voxelStyle} onChange={e => setVoxelStyle(e.target.value as VoxelStyle)} className="w-full p-2 border-2 border-black font-bold uppercase text-xs bg-white">
+                  <div className="space-y-1">
+                    <label className="text-[9px] font-black uppercase text-stone-400">Art Style</label>
+                    <select value={style} onChange={e => setStyle(e.target.value as VoxelStyle)} className="w-full p-3 border-2 border-black font-black uppercase text-xs bg-white">
                       {STYLES.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[9px] font-black uppercase text-stone-400">Voxel Size</label>
+                    <select value={voxelSizeLabel} onChange={e => setVoxelSizeLabel(e.target.value as VoxelSizeLabel)} className="w-full p-3 border-2 border-black font-black uppercase text-xs bg-white">
+                      {VOXEL_SIZES.map(s => <option key={s} value={s}>{s} ({VOXEL_SIZE_MAP[s]})</option>)}
                     </select>
                   </div>
                 </div>
               </div>
             </div>
-            <div className="flex justify-end gap-4 border-t-2 border-black pt-6">
-              <button onClick={handleImageGenerate} disabled={isLoading || !prompt} className="px-10 py-3 bg-black text-white font-black uppercase shadow-[6px_6px_0px_0px_rgba(0,0,0,0.5)] active:translate-y-1 active:shadow-none disabled:opacity-50 transition-all">Ignite Forge</button>
+            <div className="flex justify-end gap-4 pt-6 border-t-2 border-stone-100">
+              <button onClick={() => setShowGenerator(false)} className="px-8 py-3 font-black uppercase text-xs hover:bg-stone-100 transition-colors">Cancel</button>
+              <button onClick={handleGenImage} disabled={isLoading || !prompt} className="px-10 py-4 bg-black text-white font-black uppercase shadow-[6px_6px_0px_0px_rgba(0,0,0,0.3)] hover:bg-yellow-300 hover:text-black transition-all disabled:opacity-30">Ignite Engine</button>
             </div>
           </div>
         )}
 
+        {/* Forge Viewport */}
         {imageData && (
           <div className="grid md:grid-cols-12 gap-8 items-start">
             <div className="md:col-span-8 space-y-6">
-              <div className="aspect-square border-4 border-black bg-gray-100 relative overflow-hidden shadow-[12px_12px_0px_0px_black]">
+              <div className="aspect-square bg-stone-200 border-4 border-black relative shadow-[16px_16px_0px_0px_black] overflow-hidden group">
+                {/* Tools Overlay */}
+                {viewMode === 'voxel' && voxelCode && (
+                   <div className="absolute top-4 left-4 z-20 flex flex-col gap-2">
+                      <div className="bg-white border-2 border-black p-1 shadow-[4px_4px_0px_0px_black] flex flex-col gap-1">
+                        <button onClick={() => setCurrentTool('view')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'view' ? 'bg-black text-white' : ''}`} title="View Camera">
+                           👁️
+                        </button>
+                        <button onClick={() => setCurrentTool('paint')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'paint' ? 'bg-black text-white' : ''}`} title="Paint Voxel">
+                           🖌️
+                        </button>
+                        <button onClick={() => setCurrentTool('erase')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'erase' ? 'bg-black text-white' : ''}`} title="Erase Voxel">
+                           🧹
+                        </button>
+                      </div>
+
+                      {/* Mini Palette for Painting */}
+                      {currentTool === 'paint' && (
+                        <div className="bg-white border-2 border-black p-2 shadow-[4px_4px_0px_0px_black] grid grid-cols-2 gap-1 w-20">
+                           {palette.map((c, i) => (
+                             <button 
+                               key={i} 
+                               onClick={() => setSelectedPaletteIndex(i)} 
+                               className={`w-6 h-6 border border-black ${selectedPaletteIndex === i ? 'ring-2 ring-black ring-offset-1' : ''}`}
+                               style={{backgroundColor: c}}
+                             />
+                           ))}
+                        </div>
+                      )}
+                   </div>
+                )}
+
                 {isLoading && (
-                  <div className="absolute inset-0 z-50 bg-white/95 p-12 flex flex-col justify-center">
-                    <h3 className="text-4xl font-black uppercase italic mb-4 animate-pulse">Forging World<span className="loading-dots"></span></h3>
-                    <div className="font-mono text-xs text-gray-400 border-l-4 border-black pl-4 py-2 bg-gray-50 uppercase tracking-tighter max-h-48 overflow-y-auto">
-                      {thinkingText || "Transmuting image to voxel coordinates..."}
+                  <div className="absolute inset-0 z-50 bg-white/95 p-12 flex flex-col justify-center animate-in fade-in duration-500">
+                    <h3 className="text-5xl font-black uppercase italic mb-6 animate-pulse">Forging Artifact<span className="loading-dots"></span></h3>
+                    <div className="font-mono text-[10px] text-stone-400 border-l-4 border-black pl-4 py-4 bg-stone-50 max-h-40 overflow-y-auto uppercase leading-tight">
+                      {thinkingText || "Transmuting pixels into 3D voxel coordinate arrays..."}
                     </div>
                   </div>
                 )}
-                {status === 'saving' && (
-                  <div className="absolute inset-0 z-50 bg-black/60 flex flex-col items-center justify-center backdrop-blur-sm">
-                    <div className="w-12 h-12 border-4 border-white border-t-transparent rounded-full animate-spin mb-4"></div>
-                    <span className="text-white font-black uppercase text-xs tracking-widest">Capturing Scene...</span>
+                {(status === 'saving') && (
+                  <div className="absolute inset-0 z-50 bg-black/60 flex flex-col items-center justify-center backdrop-blur-md">
+                     <div className="w-10 h-10 border-4 border-white border-t-transparent rounded-full animate-spin mb-4"></div>
+                     <span className="text-white font-black uppercase text-xs tracking-widest animate-pulse">Processing Export Data...</span>
                   </div>
                 )}
-                {viewMode === 'image' && <img src={imageData} className="w-full h-full object-contain" />}
-                {viewMode === 'voxel' && voxelCode && (
-                  <iframe 
-                    ref={iframeRef}
-                    srcDoc={voxelCode} 
-                    className="w-full h-full border-none" 
-                    sandbox="allow-scripts allow-same-origin" 
-                    crossOrigin="anonymous"
-                  />
-                )}
+                {viewMode === 'image' && <img src={imageData} className="w-full h-full object-contain" alt="Subject" />}
+                {viewMode === 'voxel' && voxelCode && <iframe ref={iframeRef} srcDoc={voxelCode} className="w-full h-full border-none" sandbox="allow-scripts allow-same-origin" />}
               </div>
-              
               <div className="flex gap-4">
-                <button onClick={() => setViewMode(viewMode === 'image' ? 'voxel' : 'image')} disabled={!voxelCode} className={`flex-1 py-4 border-4 border-black font-black uppercase shadow-[6px_6px_0px_0px_black] transition-all active:translate-y-1 active:shadow-none ${viewMode === 'image' ? 'bg-white hover:bg-black hover:text-white' : 'bg-black text-white hover:bg-yellow-300 hover:text-black'}`}>
-                  {viewMode === 'image' ? 'View 3D Forge' : 'View Source Ref'}
-                </button>
-                <button onClick={handleVoxelize} disabled={isLoading} className="flex-1 py-4 bg-yellow-300 text-black border-4 border-black font-black uppercase shadow-[6px_6px_0px_0px_rgba(0,0,0,0.8)] hover:bg-black hover:text-white transition-all active:translate-y-1 active:shadow-none disabled:opacity-50">
-                  Transmute to Voxel
-                </button>
+                <button onClick={() => setViewMode(v => v === 'image' ? 'voxel' : 'image')} disabled={!voxelCode} className={`flex-1 py-4 border-4 border-black font-black uppercase shadow-[6px_6px_0px_0px_black] transition-all active:translate-y-1 active:shadow-none ${viewMode === 'voxel' ? 'bg-black text-white' : 'bg-white hover:bg-stone-100'}`}>Toggle Perspective</button>
+                <button onClick={handleTransmute} disabled={isLoading} className="flex-1 py-4 bg-yellow-300 border-4 border-black font-black uppercase shadow-[6px_6px_0px_0px_black] hover:bg-black hover:text-white transition-all active:translate-y-1 active:shadow-none">Transmute Subject</button>
               </div>
             </div>
 
-            <div className="md:col-span-4 space-y-8 animate-in slide-in-from-right-4 duration-500">
-              <div className="border-4 border-black bg-white shadow-[6px_6px_0px_0px_black] overflow-hidden">
-                <div className="flex bg-gray-100 border-b-4 border-black">
-                  {(['transform', 'atmosphere', 'export'] as InspectorTab[]).map(tab => (
-                    <button key={tab} onClick={() => setActiveTab(tab)} className={`flex-1 py-3 text-[9px] font-black uppercase tracking-widest border-r-2 last:border-r-0 border-black transition-colors ${activeTab === tab ? 'bg-black text-white' : 'bg-white text-black hover:bg-yellow-50'}`}>
-                      {tab}
-                    </button>
+            <div className="md:col-span-4 space-y-6">
+              <div className="bg-white border-4 border-black shadow-[8px_8px_0px_0px_black] overflow-hidden">
+                <div className="flex border-b-4 border-black bg-stone-100">
+                  {(['transform', 'atmosphere', 'physics', 'export'] as InspectorTab[]).map(t => (
+                    <button key={t} onClick={() => setActiveTab(t)} className={`flex-1 py-3 text-[9px] font-black uppercase tracking-widest transition-colors border-r-2 last:border-r-0 border-black ${activeTab === t ? 'bg-black text-white' : 'bg-white hover:bg-stone-50'}`}>{t}</button>
                   ))}
                 </div>
-
                 <div className="p-6 space-y-6">
                   {activeTab === 'transform' && (
                     <div className="space-y-4">
-                      <div className="space-y-2">
-                        <label className="block text-[10px] font-black uppercase text-gray-400">Camera Viewpoints</label>
-                        <div className="grid grid-cols-2 gap-2">
-                          {['isometric', 'top', 'front', 'side'].map(angle => (
-                            <button key={angle} onClick={() => {
-                              if (voxelCode) {
-                                const views = {
-                                  isometric: { x: 40, y: 40, z: 40 },
-                                  top: { x: 0.1, y: 60, z: 0 },
-                                  front: { x: 0, y: 10, z: 60 },
-                                  side: { x: 60, y: 10, z: 0 }
-                                };
-                                const updated = setCameraView(voxelCode, views[angle as keyof typeof views]);
-                                setVoxelCode(updated);
-                              }
-                            }} className="py-2 border-2 border-black font-black text-[8px] uppercase hover:bg-black hover:text-white transition-all bg-gray-50">
-                              {angle}
-                            </button>
-                          ))}
-                        </div>
+                      <label className="text-[10px] font-black uppercase text-stone-400">Quick Camera</label>
+                      <div className="grid grid-cols-2 gap-2">
+                        {['isometric', 'top', 'front', 'side'].map(a => (
+                          <button key={a} onClick={() => { if (voxelCode) {
+                            const v = { isometric: {x:40, y:40, z:40}, top: {x:0.1, y:60, z:0}, front: {x:0, y:10, z:60}, side: {x:60, y:10, z:0} };
+                            setVoxelCode(setCameraView(voxelCode, v[a as keyof typeof v]));
+                          }}} className="py-2 border-2 border-black font-black text-[9px] uppercase hover:bg-black hover:text-white transition-all">View {a}</button>
+                        ))}
                       </div>
-                      <div className="space-y-2">
-                        <label className="block text-[10px] font-black uppercase text-gray-400">Animation</label>
-                        <button onClick={() => { setAutoRotate(!autoRotate); patchScene({ autoRotate: !autoRotate }); }} className={`w-full py-2 border-2 border-black font-black text-[10px] uppercase transition-all ${autoRotate ? 'bg-black text-white' : 'bg-white hover:bg-gray-100'}`}>
-                          Orbit Mode: {autoRotate ? 'ON' : 'OFF'}
-                        </button>
-                      </div>
+                      <button onClick={() => { setAutoRotate(!autoRotate); handlePatch({ autoRotate: !autoRotate }); }} className={`w-full py-3 border-2 border-black font-black uppercase text-[10px] transition-all ${autoRotate ? 'bg-black text-white' : 'bg-white hover:bg-stone-100'}`}>Orbit Rotation: {autoRotate ? 'ON' : 'OFF'}</button>
                     </div>
                   )}
-
                   {activeTab === 'atmosphere' && (
                     <div className="space-y-6">
                       <div className="space-y-2">
-                        <label className="block text-[10px] font-black uppercase text-gray-400">Sun Power</label>
-                        <input type="range" min="0.1" max="3" step="0.1" value={lightIntensity} onChange={e => { setLightIntensity(Number(e.target.value)); patchScene({ lightIntensity: Number(e.target.value) }); }} className="w-full accent-black cursor-pointer" />
+                        <label className="text-[10px] font-black uppercase text-stone-400">Luminance</label>
+                        <input type="range" min="0" max="3" step="0.1" value={lightIntensity} onChange={e => { setLightIntensity(Number(e.target.value)); handlePatch({ lightIntensity: Number(e.target.value) }); }} className="w-full accent-black cursor-pointer" />
                       </div>
                       <div className="space-y-2">
-                        <label className="block text-[10px] font-black uppercase text-gray-400">Fog Thickness</label>
-                        <input type="range" min="0" max="2" step="0.1" value={fogDensity} onChange={e => { setFogDensity(Number(e.target.value)); patchScene({ fogDensity: Number(e.target.value) }); }} className="w-full accent-black cursor-pointer" />
+                        <label className="text-[10px] font-black uppercase text-stone-400">Aether Density</label>
+                        <input type="range" min="0" max="1" step="0.1" value={fogDensity} onChange={e => { setFogDensity(Number(e.target.value)); handlePatch({ fogDensity: Number(e.target.value) }); }} className="w-full accent-black cursor-pointer" />
                       </div>
-                      <div className="space-y-2">
-                        <label className="block text-[10px] font-black uppercase text-gray-400">Horizon Tint</label>
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 border-2 border-black shadow-[3px_3px_0px_0px_black] overflow-hidden">
-                            <input type="color" value={sceneBgColor} onChange={e => { setSceneBgColor(e.target.value); patchScene({ backgroundColor: e.target.value }); }} className="custom-color-input" />
-                          </div>
-                          <span className="text-[10px] font-mono font-bold uppercase border-b border-black pb-1">{sceneBgColor}</span>
+                      <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 border-2 border-black shadow-[3px_3px_0px_0px_black] overflow-hidden">
+                          <input type="color" value={bgColor} onChange={e => { setBgColor(e.target.value); handlePatch({ backgroundColor: e.target.value }); }} className="w-full h-full cursor-pointer scale-150" />
+                        </div>
+                        <span className="text-[10px] font-mono font-bold uppercase border-b border-black pb-1">{bgColor}</span>
+                      </div>
+                    </div>
+                  )}
+                  {activeTab === 'physics' && (
+                    <div className="space-y-4">
+                      <div className="bg-yellow-50 p-3 border-2 border-black text-[9px] font-bold uppercase italic leading-tight">Cellular Gravity enabled: Simulates block stability and collisions.</div>
+                      <button onClick={() => togglePhysics(!physicsOn)} disabled={!voxelCode} className={`w-full py-4 border-2 border-black font-black uppercase text-xs shadow-[4px_4px_0px_0px_black] active:translate-y-1 active:shadow-none transition-all ${physicsOn ? 'bg-green-400' : 'bg-white hover:bg-stone-50'}`}>{physicsOn ? 'Simulation Active' : 'Enable Physics'}</button>
+                      <button onClick={resetPhysics} disabled={!voxelCode} className="w-full py-2 border-2 border-black font-black uppercase text-[10px] hover:bg-red-500 hover:text-white transition-all bg-white">Reset Settlement</button>
+                    </div>
+                  )}
+                  {activeTab === 'export' && (
+                    <div className="space-y-6">
+                      <div className="space-y-4 border-b-2 border-stone-100 pb-4">
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-black uppercase text-stone-400">Target Format</label>
+                          <select value={exportFormat} onChange={e => setExportFormat(e.target.value as ExportFormat)} className="w-full p-2 border-2 border-black font-black uppercase text-xs bg-white">
+                            <option value="GLTF">GLTF (Full Scene)</option>
+                            <option value="OBJ">Wavefront OBJ (Mesh)</option>
+                            <option value="VOX">MagicaVoxel JSON</option>
+                          </select>
+                        </div>
+                        <div className="flex items-center gap-2">
+                           <input type="checkbox" id="optimize" checked={optimizeExport} onChange={e => setOptimizeExport(e.target.checked)} className="w-4 h-4 accent-black" />
+                           <label htmlFor="optimize" className="text-[10px] font-black uppercase cursor-pointer">Optimize Mesh (Greedy LOD)</label>
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-black uppercase text-stone-400">Resolution (LOD)</label>
+                          <select value={exportLOD} onChange={e => setExportLOD(e.target.value)} className="w-full p-2 border-2 border-black font-black uppercase text-xs bg-white">
+                            <option value="High">Native (High Detail)</option>
+                            <option value="Med">Balanced (Compressed)</option>
+                            <option value="Low">Low Poly (Draft)</option>
+                          </select>
                         </div>
                       </div>
-                    </div>
-                  )}
-
-                  {activeTab === 'export' && (
-                    <div className="space-y-4">
-                      <div className="p-3 bg-blue-50 border-2 border-black text-[9px] font-bold leading-tight uppercase italic">
-                        Ready for Export: Extract mesh data for Blender or MagicaVoxel.
-                      </div>
-                      <div className="space-y-3">
-                        <button 
-                          onClick={() => handleExport('OBJ')}
-                          disabled={!voxelCode}
-                          className="w-full py-3 bg-white border-2 border-black font-black text-xs uppercase shadow-[4px_4px_0px_0px_black] hover:bg-black hover:text-white active:translate-y-1 active:shadow-none transition-all disabled:opacity-30"
-                        >
-                          Download .OBJ
-                        </button>
-                        <button 
-                          onClick={() => handleExport('VOX')}
-                          disabled={!voxelCode}
-                          className="w-full py-3 bg-white border-2 border-black font-black text-xs uppercase shadow-[4px_4px_0px_0px_black] hover:bg-black hover:text-white active:translate-y-1 active:shadow-none transition-all disabled:opacity-30"
-                        >
-                          Download .VOX
-                        </button>
-                      </div>
+                      <button onClick={handleExport} disabled={!voxelCode || status === 'saving'} className="w-full py-4 bg-black text-white border-2 border-black font-black uppercase text-xs shadow-[6px_6px_0px_0px_rgba(0,0,0,0.3)] hover:bg-yellow-300 hover:text-black transition-all active:translate-y-1 active:shadow-none">Generate Advanced Export</button>
                     </div>
                   )}
                 </div>
-
-                <div className="p-4 border-t-2 border-black flex gap-2 bg-gray-50">
-                  <button onClick={handleUndo} disabled={historyIndex <= 0} className="flex-1 py-1 border-2 border-black text-[8px] font-black uppercase disabled:opacity-30 bg-white hover:bg-black hover:text-white transition-all">Undo</button>
-                  <button onClick={handleRedo} disabled={historyIndex >= history.length - 1} className="flex-1 py-1 border-2 border-black text-[8px] font-black uppercase disabled:opacity-30 bg-white hover:bg-black hover:text-white transition-all">Redo</button>
-                  <button onClick={handleSaveToGallery} disabled={status === 'saving'} className="flex-1 py-1 bg-yellow-300 border-2 border-black font-black uppercase text-[8px] shadow-[3px_3px_0px_0px_black] active:shadow-none hover:bg-black hover:text-white transition-all">
-                    {status === 'saving' ? 'Capturing...' : 'Secure V'}
-                  </button>
+                <div className="p-4 border-t-2 border-stone-100 bg-stone-50 flex gap-2">
+                  <button onClick={handleUndo} disabled={!canUndo} className="flex-1 py-1 border-2 border-black text-[8px] font-black uppercase bg-white disabled:opacity-20 hover:bg-stone-100 transition-colors">Undo</button>
+                  <button onClick={handleRedo} disabled={!canRedo} className="flex-1 py-1 border-2 border-black text-[8px] font-black uppercase bg-white disabled:opacity-20 hover:bg-stone-100 transition-colors">Redo</button>
+                  <button onClick={handleSave} disabled={status === 'saving' || !imageData} className="flex-1 py-1 bg-yellow-300 border-2 border-black text-[8px] font-black uppercase shadow-[3px_3px_0px_0px_black] active:shadow-none transition-all disabled:opacity-30 hover:bg-yellow-400">Secure Vault</button>
                 </div>
               </div>
-              
-              {errorMsg && <div className="p-4 border-4 border-red-500 bg-red-50 text-red-700 text-xs font-black uppercase tracking-tighter">Forge Error: {errorMsg}</div>}
+              {errorMsg && <div className="p-4 bg-red-50 border-4 border-red-500 text-red-700 text-[10px] font-black uppercase tracking-tighter">Forge Error: {errorMsg}</div>}
             </div>
           </div>
         )}
