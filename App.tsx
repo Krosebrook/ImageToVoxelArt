@@ -23,7 +23,7 @@ type VoxelStyle = 'Classic' | 'Micro' | 'Low Poly' | 'Cyberpunk';
 type VoxelSizeLabel = 'Micro' | 'Classic' | 'Large';
 type InspectorTab = 'transform' | 'atmosphere' | 'physics' | 'export';
 type ExportFormat = 'OBJ' | 'VOX' | 'GLTF';
-type ToolMode = 'view' | 'paint' | 'erase';
+type ToolMode = 'view' | 'paint' | 'erase' | 'add' | 'pick';
 
 const VOXEL_SIZE_MAP: Record<VoxelSizeLabel, number> = {
   'Micro': 0.5,
@@ -108,6 +108,7 @@ const App: React.FC = () => {
   const [exportFormat, setExportFormat] = useState<ExportFormat>('GLTF');
   const [optimizeExport, setOptimizeExport] = useState(true);
   const [exportLOD, setExportLOD] = useState('High');
+  const [useTextureAtlas, setUseTextureAtlas] = useState(false);
 
   // Persistence & History
   const [history, setHistory] = useState<SceneState[]>([]);
@@ -155,10 +156,32 @@ const App: React.FC = () => {
       if (e.data.type === 'HISTORY_STATUS') {
         setEditHistory({ canUndo: e.data.canUndo, canRedo: e.data.canRedo });
       }
+      if (e.data.type === 'PICK_COLOR') {
+        // Handle Eyedropper
+        const hex = e.data.color;
+        // Check if color exists in palette
+        const idx = palette.indexOf(hex);
+        if (idx !== -1) {
+           setSelectedPaletteIndex(idx);
+        } else {
+           // Add to palette if not exists, replace current or push
+           const newPalette = [...palette];
+           if (newPalette.length < 10) {
+              newPalette.push(hex);
+              setPalette(newPalette);
+              setSelectedPaletteIndex(newPalette.length - 1);
+           } else {
+              newPalette[selectedPaletteIndex] = hex;
+              setPalette(newPalette);
+           }
+        }
+        // Switch back to paint automatically? Optional, but users often pick then paint.
+        setCurrentTool('paint');
+      }
     };
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, []);
+  }, [palette, selectedPaletteIndex]);
 
   // --- Tool & Bridge Communications ---
   useEffect(() => {
@@ -282,7 +305,8 @@ const App: React.FC = () => {
         format: exportFormat,
         options: {
           optimize: optimizeExport,
-          lod: exportLOD
+          lod: exportLOD,
+          textureAtlas: useTextureAtlas
         }
       }, '*');
     }
@@ -468,16 +492,22 @@ const App: React.FC = () => {
                         <button onClick={() => setCurrentTool('view')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'view' ? 'bg-black text-white' : ''}`} title="View Camera">
                            👁️
                         </button>
+                        <button onClick={() => setCurrentTool('add')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'add' ? 'bg-black text-white' : ''}`} title="Build (Add Voxel)">
+                           ➕
+                        </button>
                         <button onClick={() => setCurrentTool('paint')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'paint' ? 'bg-black text-white' : ''}`} title="Paint Voxel">
                            🖌️
                         </button>
                         <button onClick={() => setCurrentTool('erase')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'erase' ? 'bg-black text-white' : ''}`} title="Erase Voxel">
                            🧹
                         </button>
+                        <button onClick={() => setCurrentTool('pick')} className={`p-2 border border-black hover:bg-yellow-100 transition-colors ${currentTool === 'pick' ? 'bg-black text-white' : ''}`} title="Pipette (Pick Color)">
+                           🧪
+                        </button>
                       </div>
 
-                      {/* Mini Palette for Painting */}
-                      {currentTool === 'paint' && (
+                      {/* Mini Palette for Painting/Building */}
+                      {(currentTool === 'paint' || currentTool === 'add') && (
                         <div className="bg-white border-2 border-black p-2 shadow-[4px_4px_0px_0px_black] grid grid-cols-2 gap-1 w-20">
                            {palette.map((c, i) => (
                              <button 
@@ -577,6 +607,12 @@ const App: React.FC = () => {
                            <input type="checkbox" id="optimize" checked={optimizeExport} onChange={e => setOptimizeExport(e.target.checked)} className="w-4 h-4 accent-black" />
                            <label htmlFor="optimize" className="text-[10px] font-black uppercase cursor-pointer">Optimize Mesh (Greedy LOD)</label>
                         </div>
+                        {exportFormat === 'GLTF' && (
+                          <div className="flex items-center gap-2">
+                             <input type="checkbox" id="atlas" checked={useTextureAtlas} onChange={e => setUseTextureAtlas(e.target.checked)} className="w-4 h-4 accent-black" />
+                             <label htmlFor="atlas" className="text-[10px] font-black uppercase cursor-pointer">Bake Texture Atlas (Game Ready)</label>
+                          </div>
+                        )}
                         <div className="space-y-1">
                           <label className="text-[10px] font-black uppercase text-stone-400">Resolution (LOD)</label>
                           <select value={exportLOD} onChange={e => setExportLOD(e.target.value)} className="w-full p-2 border-2 border-black font-black uppercase text-xs bg-white">
